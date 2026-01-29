@@ -184,17 +184,26 @@ def _(
 
     def parse_session_file(path):
         """Parse a Claude session JSONL file into a simple dict structure.
+        
+        Groups streamed assistant messages by their message.id and tracks tool results.
 
         Returns:
             Tuple of (session_data, error_reason). If parsing succeeds, error_reason is None.
             If parsing fails, session_data is None and error_reason explains why.
         """
-        messages = []
         session_info = {}
-        pending_tool_calls = {}  # Track tool calls waiting for results
         line_count = 0
         json_errors = 0
         all_message_types = set()
+        
+        # Track API responses by their message ID (handles streaming)
+        api_responses = {}  # message_id -> response data
+        # Track tool results from user messages
+        tool_results = {}  # tool_use_id -> result content
+        # Track user prompts
+        user_prompts = []  # List of user message data
+        # Track order of messages by uuid
+        message_order = []  # List of (uuid, type, message_id_or_none)
 
         try:
             with open(path) as f:
@@ -211,7 +220,7 @@ def _(
                         if msg_type == "queue-operation":
                             continue
 
-                        # Capture session info from ANY message that has it (not just the first)
+                        # Capture session info from ANY message that has it
                         if obj.get("sessionId"):
                             if not session_info.get("sessionId"):
                                 session_info["sessionId"] = obj.get("sessionId")
@@ -223,9 +232,77 @@ def _(
                             if not session_info.get("version") and obj.get("version"):
                                 session_info["version"] = obj.get("version")
 
-                        # Collect user and assistant messages
-                        if msg_type in ("user", "assistant"):
-                            messages.append(obj)
+                        timestamp_str = obj.get("timestamp", "")
+                        timestamp = parse_timestamp(timestamp_str) if timestamp_str else datetime.now()
+                        uuid = obj.get("uuid")
+
+                        # Handle assistant messages (group by message.id)
+                        if msg_type == "assistant":
+                            msg_data = obj.get("message", {})
+                            msg_id = msg_data.get("id")
+                            
+                            if msg_id:
+                                # Initialize or update the API response for this message ID
+                                if msg_id not in api_responses:
+                                    api_responses[msg_id] = {
+                                        "message_id": msg_id,
+                                        "model": msg_data.get("model", "unknown"),
+                                        "content_blocks": [],
+                                        "usage": {},
+                                        "timestamp": timestamp,
+                                        "parent_uuid": obj.get("parentUuid"),
+                                        "uuid": uuid,
+                                    }
+                                    message_order.append((uuid, "assistant", msg_id))
+                                
+                                # Append content blocks from this streamed chunk
+                                content = msg_data.get("content", [])
+                                if isinstance(content, list):
+                                    api_responses[msg_id]["content_blocks"].extend(content)
+                                
+                                # Update usage if present (later chunks may have complete usage)
+                                usage = msg_data.get("usage", {})
+                                if usage:
+                                    api_responses[msg_id]["usage"] = usage
+
+                        # Handle user messages
+                        elif msg_type == "user":
+                            msg_data = obj.get("message", {})
+                            content = msg_data.get("content", "")
+                            user_text = []
+                            
+                            # Extract text and tool results
+                            if isinstance(content, str):
+                                user_text.append(content)
+                            elif isinstance(content, list):
+                                for c in content:
+                                    if isinstance(c, dict):
+                                        if c.get("type") == "text":
+                                            user_text.append(c.get("text", ""))
+                                        elif c.get("type") == "tool_result":
+                                            # Store tool result for later matching
+                                            tool_use_id = c.get("tool_use_id")
+                                            if tool_use_id:
+                                                result_content = c.get("content", "")
+                                                # Handle both string and list format
+                                                if isinstance(result_content, str):
+                                                    tool_results[tool_use_id] = result_content[:10000]
+                                                elif isinstance(result_content, list):
+                                                    text_parts = []
+                                                    for block in result_content:
+                                                        if isinstance(block, dict) and block.get("type") == "text":
+                                                            text_parts.append(block.get("text", ""))
+                                                    tool_results[tool_use_id] = "\n".join(text_parts)[:10000]
+                            
+                            # Only record user prompts that have actual text content
+                            if user_text:
+                                user_prompts.append({
+                                    "text": " ".join(user_text),
+                                    "timestamp": timestamp,
+                                    "uuid": uuid,
+                                    "parent_uuid": obj.get("parentUuid"),
+                                })
+                                message_order.append((uuid, "user", None))
 
                     except json.JSONDecodeError as e:
                         json_errors += 1
@@ -236,107 +313,48 @@ def _(
         # Check if we found a valid session
         if not session_info.get("sessionId"):
             # Try to extract sessionId from the filename (UUID pattern)
-            filename = path.stem  # Get filename without extension
+            filename = path.stem
             if len(filename) == 36 and filename.count('-') == 4:
                 session_info["sessionId"] = filename
             else:
                 return None, f"No sessionId found in {line_count} lines (types: {all_message_types}, json_errors: {json_errors})"
 
-        if not messages:
-            return None, f"No user/assistant messages found in {line_count} lines (types: {all_message_types})"
+        if not api_responses and not user_prompts:
+            return None, f"No messages found in {line_count} lines (types: {all_message_types})"
 
-        # Organize messages into turns (user → assistant pairs)
-        turns = []
-        current_turn = None
-
-        for msg in messages:
-            msg_type = msg.get("type")
-            timestamp_str = msg.get("timestamp", "")
-            timestamp = parse_timestamp(timestamp_str) if timestamp_str else datetime.now()
-
-            if msg_type == "user":
-                # Start new turn
-                if current_turn:
-                    turns.append(current_turn)
-
-                # Extract user content - handle both string and list formats
-                msg_data = msg.get("message", {})
-                content = msg_data.get("content", "")
-                user_text = []
-
-                if isinstance(content, str):
-                    # Content is a plain string
-                    user_text.append(content)
-                elif isinstance(content, list):
-                    # Content is a list of content blocks
-                    for c in content:
-                        if isinstance(c, dict):
-                            if c.get("type") == "text":
-                                user_text.append(c.get("text", ""))
-                            elif c.get("type") == "tool_result":
-                                # Tool results are part of user messages
-                                tool_use_id = c.get("tool_use_id")
-                                if tool_use_id and tool_use_id in pending_tool_calls:
-                                    tc = pending_tool_calls[tool_use_id]
-                                    result_content = c.get("content", "")
-                                    # Handle both string and list format for tool results
-                                    if isinstance(result_content, str):
-                                        tc["result"] = result_content[:10000]
-                                    elif isinstance(result_content, list):
-                                        text_parts = []
-                                        for block in result_content:
-                                            if isinstance(block, dict) and block.get("type") == "text":
-                                                text_parts.append(block.get("text", ""))
-                                        tc["result"] = "\n".join(text_parts)[:10000]
-                                    tc["result_timestamp"] = timestamp
-
-                current_turn = {
-                    "user_message": " ".join(user_text),
-                    "assistant_messages": [],
-                    "tool_calls": [],
-                    "started_at": timestamp,
-                    "ended_at": timestamp,
-                }
-
-            elif msg_type == "assistant" and current_turn:
-                msg_data = msg.get("message", {})
-                content = msg_data.get("content", [])
-                usage_data = msg_data.get("usage", {})
-
-                # Extract text and tool_use blocks
-                text_content = []
-                tool_calls = []
-
-                if isinstance(content, list):
-                    for c in content:
-                        if isinstance(c, dict):
-                            if c.get("type") == "text":
-                                text_content.append(c.get("text", ""))
-                            elif c.get("type") == "tool_use":
-                                tc = {
-                                    "id": c.get("id", ""),
-                                    "name": c.get("name", "unknown"),
-                                    "input": c.get("input", {}),
-                                    "timestamp": timestamp,
-                                    "result": None,
-                                    "result_timestamp": None,
-                                }
-                                tool_calls.append(tc)
-                                # Track for later result matching
-                                pending_tool_calls[tc["id"]] = tc
-
-                current_turn["assistant_messages"].append({
-                    "text": " ".join(text_content),
-                    "model": msg_data.get("model", "unknown"),
-                    "usage": usage_data,
-                    "timestamp": timestamp,
-                })
-                current_turn["tool_calls"].extend(tool_calls)
-                current_turn["ended_at"] = timestamp
-
-        # Add last turn
-        if current_turn:
-            turns.append(current_turn)
+        # Build list of LLM responses with their tool calls
+        llm_responses = []
+        for msg_id, response_data in api_responses.items():
+            # Extract text and tool_use blocks
+            text_parts = []
+            tool_calls = []
+            
+            for block in response_data["content_blocks"]:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif block.get("type") == "tool_use":
+                        tool_id = block.get("id", "")
+                        tool_calls.append({
+                            "id": tool_id,
+                            "name": block.get("name", "unknown"),
+                            "input": block.get("input", {}),
+                            "result": tool_results.get(tool_id),  # Match with tool result
+                        })
+            
+            llm_responses.append({
+                "message_id": msg_id,
+                "model": response_data["model"],
+                "text": " ".join(text_parts),
+                "tool_calls": tool_calls,
+                "usage": response_data["usage"],
+                "timestamp": response_data["timestamp"],
+                "parent_uuid": response_data["parent_uuid"],
+                "uuid": response_data["uuid"],
+            })
+        
+        # Sort by timestamp to maintain order
+        llm_responses.sort(key=lambda r: r["timestamp"])
 
         # Success - return session data with None error
         return {
@@ -344,7 +362,8 @@ def _(
             "cwd": session_info.get("cwd"),
             "git_branch": session_info.get("gitBranch"),
             "version": session_info.get("version"),
-            "turns": turns,
+            "user_prompts": user_prompts,
+            "llm_responses": llm_responses,
         }, None
 
     def import_single_session(session_file, project_name):
@@ -355,7 +374,7 @@ def _(
             "session_id": "",
             "status": "error",
             "error": "",
-            "turns": 0,
+            "llm_responses": 0,
             "tool_calls": 0,
             "weave_calls": 0,
             "tokens": 0,
@@ -371,57 +390,80 @@ def _(
                 result["error"] = f"Parse failed: {parse_error}"
                 return result
 
-            turns = session.get("turns", [])
-            if not turns:
+            llm_responses = session.get("llm_responses", [])
+            user_prompts = session.get("user_prompts", [])
+            
+            if not llm_responses:
                 result["status"] = "skipped"
-                result["error"] = "No turns found"
+                result["error"] = "No LLM responses found"
                 result["session_id"] = session["session_id"]
                 return result
 
             result["session_id"] = session["session_id"]
 
             # Calculate totals
-            total_tool_calls = sum(len(t.get("tool_calls", [])) for t in turns)
+            total_tool_calls = sum(len(r.get("tool_calls", [])) for r in llm_responses)
             total_tokens = 0
             models = set()
 
-            for turn in turns:
-                for msg in turn.get("assistant_messages", []):
-                    usage = msg.get("usage", {})
-                    total_tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-                    model = msg.get("model", "")
-                    if model:
-                        models.add(model)
+            for response in llm_responses:
+                usage = response.get("usage", {})
+                total_tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+                model = response.get("model", "")
+                if model:
+                    models.add(model)
 
             # Get first user prompt for display
-            first_prompt = turns[0].get("user_message", "") if turns else ""
+            first_prompt = user_prompts[0]["text"] if user_prompts else ""
             display_name = (first_prompt[:50] + "...") if len(first_prompt) > 50 else first_prompt
 
             # Get session timestamps
-            session_started = turns[0].get("started_at") if turns else None
-            session_ended = turns[-1].get("ended_at") if turns else None
+            session_started = user_prompts[0]["timestamp"] if user_prompts else (llm_responses[0]["timestamp"] if llm_responses else None)
+            session_ended = llm_responses[-1]["timestamp"] if llm_responses else None
 
             # Build messages array for ChatView (OpenAI format)
+            # Interleave user prompts and LLM responses by timestamp
+            all_entries = []
+            for prompt in user_prompts:
+                all_entries.append({
+                    "type": "user",
+                    "timestamp": prompt["timestamp"],
+                    "data": prompt,
+                })
+            for response in llm_responses:
+                all_entries.append({
+                    "type": "llm_response", 
+                    "timestamp": response["timestamp"],
+                    "data": response,
+                })
+
+            # Sort by timestamp to maintain conversation order
+            all_entries.sort(key=lambda e: e["timestamp"])
+
+            # Build messages array - exclude the final assistant response
+            # (it will be in the output instead)
             messages = []
-            for turn in turns:
-                # Add user message
-                user_msg = turn.get("user_message", "")
-                if user_msg:
+            for i, entry in enumerate(all_entries):
+                # Skip the last entry if it's an assistant response (goes in output)
+                is_last_assistant = (i == len(all_entries) - 1 and entry["type"] == "llm_response")
+                if is_last_assistant:
+                    continue
+                    
+                if entry["type"] == "user":
                     messages.append({
                         "role": "user",
-                        "content": user_msg
+                        "content": entry["data"]["text"]
                     })
-
-                # Add assistant message(s) with tool_calls
-                for asst_msg in turn.get("assistant_messages", []):
+                else:
+                    response = entry["data"]
                     asst_entry = {
                         "role": "assistant",
-                        "content": asst_msg.get("text") or None,
+                        "content": response.get("text") or None,
                     }
-
-                    # Include tool_calls in OpenAI format if present in this turn
+                    
+                    # Include tool_calls in OpenAI format if present
                     tool_calls_for_msg = []
-                    for tc in turn.get("tool_calls", []):
+                    for tc in response.get("tool_calls", []):
                         tool_calls_for_msg.append({
                             "id": tc.get("id", ""),
                             "type": "function",
@@ -430,22 +472,25 @@ def _(
                                 "arguments": json.dumps(tc.get("input", {}))
                             }
                         })
-
+                    
                     if tool_calls_for_msg:
                         asst_entry["tool_calls"] = tool_calls_for_msg
-
+                    
                     messages.append(asst_entry)
-
-                # Add tool results
-                for tc in turn.get("tool_calls", []):
-                    if tc.get("result"):
-                        messages.append({
-                            "role": "tool",
-                            "content": tc.get("result", "")[:1000],  # Truncate long results
-                            "tool_call_id": tc.get("id", "")
-                        })
+                    
+                    # Add tool results as separate messages
+                    for tc in response.get("tool_calls", []):
+                        if tc.get("result"):
+                            messages.append({
+                                "role": "tool",
+                                "content": tc.get("result", "")[:1000],
+                                "tool_call_id": tc.get("id", "")
+                            })
 
             # 1. CREATE SESSION CALL (root trace)
+            session_id = session["session_id"]
+            session_display = f"[{session_id[:8]}] {display_name}" if display_name else session_id
+            
             session_call = client.create_call(
                 op="claude_code.session",
                 inputs={
@@ -458,24 +503,20 @@ def _(
                     "project": project_name,
                 },
                 attributes={
-                    "session_id": session["session_id"],
+                    "session_id": session_id,
+                    "session_uuid": session_id,  # Full UUID for debugging
                     "claude_code_version": session.get("version"),
                 },
-                display_name=display_name or session["session_id"],
+                display_name=session_display,
                 use_stack=False,  # Important for retroactive logging
             )
-            # Set timestamp directly on Call object for older Weave versions
+            # Set timestamp directly on Call object
             if session_started:
                 session_call.started_at = session_started
 
             # Build choices array for ChatView output
-            # Get the final assistant message from the last turn
-            final_assistant_text = ""
-            if turns:
-                last_turn = turns[-1]
-                last_asst_messages = last_turn.get("assistant_messages", [])
-                if last_asst_messages:
-                    final_assistant_text = last_asst_messages[-1].get("text", "")
+            # Get the final assistant text from the last response
+            final_assistant_text = llm_responses[-1].get("text", "") if llm_responses else ""
 
             # Set end timestamp and finish session call
             if session_ended:
@@ -493,7 +534,7 @@ def _(
                         }
                     }],
                     # Keep existing rollup stats
-                    "turns_count": len(turns),
+                    "llm_responses_count": len(llm_responses),
                     "tool_calls_count": total_tool_calls,
                     "total_tokens": total_tokens,
                     "models": list(models),
@@ -502,81 +543,130 @@ def _(
 
             weave_calls = 1
 
-            # 2. CREATE TURN CALLS (children of session)
-            for i, turn in enumerate(turns):
-                user_msg = turn.get("user_message", "")
-                turn_display = f"Turn {i+1}: {user_msg[:30]}..." if user_msg else f"Turn {i+1}"
+            # 2. CREATE INTERLEAVED USER AND LLM RESPONSE TRACES (children of session)
+            # Combine user prompts and LLM responses, sorted by timestamp
+            all_messages = []
+            for prompt in user_prompts:
+                all_messages.append({
+                    "type": "user",
+                    "data": prompt,
+                    "timestamp": prompt["timestamp"],
+                })
+            for response in llm_responses:
+                all_messages.append({
+                    "type": "llm_response",
+                    "data": response,
+                    "timestamp": response["timestamp"],
+                })
+            
+            # Sort by timestamp to maintain conversation order
+            all_messages.sort(key=lambda m: m["timestamp"])
 
-                # Collect assistant response text
-                assistant_text = ""
-                for msg in turn.get("assistant_messages", []):
-                    assistant_text += msg.get("text", "") + "\n"
-
-                turn_call = client.create_call(
-                    op="claude_code.turn",
-                    inputs={"user_message": user_msg[:1000]},
-                    parent=session_call,  # NESTED UNDER SESSION
-                    display_name=turn_display,
-                    use_stack=False,
-                )
-                # Set timestamp directly on Call object for older Weave versions
-                if turn.get("started_at"):
-                    turn_call.started_at = turn.get("started_at")
-
-                # Set end timestamp and finish turn call
-                if turn.get("ended_at"):
-                    turn_call.ended_at = turn.get("ended_at")
-                client.finish_call(
-                    turn_call,
-                    output={
-                        "assistant_response": assistant_text[:2000],
-                        "tool_count": len(turn.get("tool_calls", [])),
-                    },
-                )
-                weave_calls += 1
-
-                # 3. CREATE TOOL CALLS (children of turn)
-                for tc in turn.get("tool_calls", []):
-                    tool_name = tc.get("name", "unknown")
-                    tool_input = tc.get("input", {})
-                    tool_result = tc.get("result")
-
-                    # Truncate large inputs
-                    truncated_input = {}
-                    for key, value in tool_input.items():
-                        if isinstance(value, str) and len(value) > 1000:
-                            truncated_input[key] = value[:1000] + "... [truncated]"
-                        else:
-                            truncated_input[key] = value
-
-                    # Calculate end timestamp
-                    tool_started = tc.get("timestamp")
-                    tool_ended = tc.get("result_timestamp") or tool_started
-
-                    tool_call = client.create_call(
-                        op=f"claude_code.tool.{tool_name}",
-                        inputs=truncated_input,
-                        parent=turn_call,  # NESTED UNDER TURN
-                        display_name=tool_name,
+            # Create traces for each message
+            for i, msg in enumerate(all_messages):
+                if msg["type"] == "user":
+                    # Create user message trace
+                    prompt = msg["data"]
+                    prompt_text = prompt.get("text", "")
+                    prompt_display = f"User: {prompt_text[:60]}..." if len(prompt_text) > 60 else f"User: {prompt_text}"
+                    
+                    user_call = client.create_call(
+                        op="claude_code.user_message",
+                        inputs={"content": prompt_text[:5000]},
+                        parent=session_call,
+                        display_name=prompt_display,
                         use_stack=False,
                     )
-                    # Set timestamp directly on Call object for older Weave versions
-                    if tool_started:
-                        tool_call.started_at = tool_started
-
-                    # Set end timestamp and finish tool call
-                    if tool_ended:
-                        tool_call.ended_at = tool_ended
+                    # Set timestamp
+                    if prompt.get("timestamp"):
+                        user_call.started_at = prompt.get("timestamp")
+                        user_call.ended_at = prompt.get("timestamp")
+                    
                     client.finish_call(
-                        tool_call,
-                        output={"result": tool_result[:1000] if tool_result else None},
+                        user_call,
+                        output={"message_uuid": prompt.get("uuid")},
                     )
                     weave_calls += 1
+
+                elif msg["type"] == "llm_response":
+                    # Create LLM response trace
+                    response = msg["data"]
+                    response_text = response.get("text", "")
+                    message_id = response.get("message_id", f"response_{i}")
+                    model = response.get("model", "unknown")
+                    
+                    # Create display name from text or tool names
+                    if response_text:
+                        response_display = f"{model}: {response_text[:40]}..."
+                    elif response.get("tool_calls"):
+                        tool_names = [tc.get("name", "unknown") for tc in response.get("tool_calls", [])]
+                        response_display = f"{model}: {', '.join(tool_names[:3])}"
+                    else:
+                        response_display = f"{model} response {i+1}"
+
+                    response_call = client.create_call(
+                        op="claude_code.llm_response",
+                        inputs={
+                            "model": model,
+                            "message_id": message_id,
+                        },
+                        parent=session_call,  # NESTED UNDER SESSION
+                        display_name=response_display,
+                        use_stack=False,
+                    )
+                    # Set timestamp
+                    if response.get("timestamp"):
+                        response_call.started_at = response.get("timestamp")
+                        response_call.ended_at = response.get("timestamp")
+
+                    # Finish LLM response call
+                    usage = response.get("usage", {})
+                    client.finish_call(
+                        response_call,
+                        output={
+                            "text": response_text[:2000],
+                            "tool_calls_count": len(response.get("tool_calls", [])),
+                            "usage": usage,
+                        },
+                    )
+                    weave_calls += 1
+
+                    # 3. CREATE TOOL CALLS (children of LLM response)
+                    for tc in response.get("tool_calls", []):
+                        tool_name = tc.get("name", "unknown")
+                        tool_input = tc.get("input", {})
+                        tool_result = tc.get("result")
+
+                        # Truncate large inputs
+                        truncated_input = {}
+                        for key, value in tool_input.items():
+                            if isinstance(value, str) and len(value) > 1000:
+                                truncated_input[key] = value[:1000] + "... [truncated]"
+                            else:
+                                truncated_input[key] = value
+
+                        tool_call = client.create_call(
+                            op=f"claude_code.tool.{tool_name}",
+                            inputs=truncated_input,
+                            parent=response_call,  # NESTED UNDER LLM RESPONSE
+                            display_name=tool_name,
+                            use_stack=False,
+                        )
+                        # Use same timestamp as parent response
+                        if response.get("timestamp"):
+                            tool_call.started_at = response.get("timestamp")
+                            tool_call.ended_at = response.get("timestamp")
+
+                        client.finish_call(
+                            tool_call,
+                            output={"result": tool_result[:1000] if tool_result else None},
+                        )
+                        weave_calls += 1
 
             # Update result
             result.update({
                 "status": "success",
-                "turns": len(turns),
+                "llm_responses": len(llm_responses),
                 "tool_calls": total_tool_calls,
                 "weave_calls": weave_calls,
                 "tokens": total_tokens,
@@ -641,7 +731,7 @@ def _(
                             import_results.append(result)
 
                             if result["status"] == "success":
-                                print(f"    ✅ Success: {result['turns']} turns, {result['tool_calls']} tools, {result['tokens']:,} tokens")
+                                print(f"    ✅ Success: {result['llm_responses']} responses, {result['tool_calls']} tools, {result['tokens']:,} tokens")
                             elif result["status"] == "skipped":
                                 print(f"    ⏭️ Skipped: {result['error']}")
                             else:
