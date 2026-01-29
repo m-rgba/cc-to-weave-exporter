@@ -286,13 +286,13 @@ def _(
                                                 result_content = c.get("content", "")
                                                 # Handle both string and list format
                                                 if isinstance(result_content, str):
-                                                    tool_results[tool_use_id] = result_content[:10000]
+                                                    tool_results[tool_use_id] = result_content
                                                 elif isinstance(result_content, list):
                                                     text_parts = []
                                                     for block in result_content:
                                                         if isinstance(block, dict) and block.get("type") == "text":
                                                             text_parts.append(block.get("text", ""))
-                                                    tool_results[tool_use_id] = "\n".join(text_parts)[:10000]
+                                                    tool_results[tool_use_id] = "\n".join(text_parts)
 
                             # Only record user prompts that have actual text content
                             if user_text:
@@ -483,7 +483,7 @@ def _(
                         if tc.get("result"):
                             messages.append({
                                 "role": "tool",
-                                "content": tc.get("result", "")[:1000],
+                                "content": tc.get("result", ""),
                                 "tool_call_id": tc.get("id", "")
                             })
 
@@ -497,7 +497,7 @@ def _(
                     # ChatView-compatible messages array
                     "messages": messages,
                     # Keep existing metadata
-                    "first_prompt": first_prompt[:500],
+                    "first_prompt": first_prompt,
                     "cwd": session.get("cwd"),
                     "git_branch": session.get("git_branch"),
                     "project": project_name,
@@ -579,7 +579,7 @@ def _(
 
                     user_call = client.create_call(
                         op="claude_code.user_message",
-                        inputs={"content": prompt_text[:5000]},
+                        inputs={"content": prompt_text},
                         parent=session_call,
                         display_name=prompt_display,
                         use_stack=False,
@@ -640,7 +640,7 @@ def _(
                     client.finish_call(
                         response_call,
                         output={
-                            "text": response_text[:2000],
+                            "text": response_text,
                             "tool_calls_count": len(response.get("tool_calls", [])),
                             "usage": usage,
                         },
@@ -653,17 +653,9 @@ def _(
                         tool_input = tc.get("input", {})
                         tool_result = tc.get("result")
 
-                        # Truncate large inputs
-                        truncated_input = {}
-                        for key, value in tool_input.items():
-                            if isinstance(value, str) and len(value) > 1000:
-                                truncated_input[key] = value[:1000] + "... [truncated]"
-                            else:
-                                truncated_input[key] = value
-
                         tool_call = client.create_call(
                             op=f"claude_code.tool.{tool_name}",
-                            inputs=truncated_input,
+                            inputs=tool_input,
                             attributes={
                                 "weave": {"kind": "tool"},
                             },
@@ -678,7 +670,7 @@ def _(
 
                         client.finish_call(
                             tool_call,
-                            output={"result": tool_result[:1000] if tool_result else None},
+                            output={"result": tool_result},
                         )
                         weave_calls += 1
 
@@ -784,11 +776,9 @@ def _(mo):
 @app.cell
 def _(mo, results_df):
     # Write results to JSON file
-    if not results_df.empty:
-        results_table = mo.ui.table(data=results_df)
-
+    results_table = mo.ui.table(data=results_df) if not results_df.empty else mo.ui.table(data=pd.DataFrame())
     results_table
-    return
+    return (results_table,)
 
 
 if __name__ == "__main__":
