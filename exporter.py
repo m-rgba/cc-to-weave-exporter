@@ -506,6 +506,8 @@ def _(
                     "session_id": session_id,
                     "session_uuid": session_id,  # Full UUID for debugging
                     "claude_code_version": session.get("version"),
+                    "session_started_at": session_started.isoformat() if session_started else None,
+                    "session_ended_at": session_ended.isoformat() if session_ended else None,
                 },
                 display_name=session_display,
                 use_stack=False,  # Important for retroactive logging
