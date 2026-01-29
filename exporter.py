@@ -12,6 +12,7 @@ def _(mo):
     return
 
 
+
 @app.cell
 def _():
     import os
@@ -138,7 +139,6 @@ def _(mo):
     """)
     return
 
-
 @app.cell
 def _(
     Path,
@@ -184,7 +184,7 @@ def _(
 
     def parse_session_file(path):
         """Parse a Claude session JSONL file into a simple dict structure.
-        
+
         Groups streamed assistant messages by their message.id and tracks tool results.
 
         Returns:
@@ -195,7 +195,7 @@ def _(
         line_count = 0
         json_errors = 0
         all_message_types = set()
-        
+
         # Track API responses by their message ID (handles streaming)
         api_responses = {}  # message_id -> response data
         # Track tool results from user messages
@@ -240,7 +240,7 @@ def _(
                         if msg_type == "assistant":
                             msg_data = obj.get("message", {})
                             msg_id = msg_data.get("id")
-                            
+
                             if msg_id:
                                 # Initialize or update the API response for this message ID
                                 if msg_id not in api_responses:
@@ -254,12 +254,12 @@ def _(
                                         "uuid": uuid,
                                     }
                                     message_order.append((uuid, "assistant", msg_id))
-                                
+
                                 # Append content blocks from this streamed chunk
                                 content = msg_data.get("content", [])
                                 if isinstance(content, list):
                                     api_responses[msg_id]["content_blocks"].extend(content)
-                                
+
                                 # Update usage if present (later chunks may have complete usage)
                                 usage = msg_data.get("usage", {})
                                 if usage:
@@ -270,7 +270,7 @@ def _(
                             msg_data = obj.get("message", {})
                             content = msg_data.get("content", "")
                             user_text = []
-                            
+
                             # Extract text and tool results
                             if isinstance(content, str):
                                 user_text.append(content)
@@ -293,7 +293,7 @@ def _(
                                                         if isinstance(block, dict) and block.get("type") == "text":
                                                             text_parts.append(block.get("text", ""))
                                                     tool_results[tool_use_id] = "\n".join(text_parts)[:10000]
-                            
+
                             # Only record user prompts that have actual text content
                             if user_text:
                                 user_prompts.append({
@@ -328,7 +328,7 @@ def _(
             # Extract text and tool_use blocks
             text_parts = []
             tool_calls = []
-            
+
             for block in response_data["content_blocks"]:
                 if isinstance(block, dict):
                     if block.get("type") == "text":
@@ -341,7 +341,7 @@ def _(
                             "input": block.get("input", {}),
                             "result": tool_results.get(tool_id),  # Match with tool result
                         })
-            
+
             llm_responses.append({
                 "message_id": msg_id,
                 "model": response_data["model"],
@@ -352,7 +352,7 @@ def _(
                 "parent_uuid": response_data["parent_uuid"],
                 "uuid": response_data["uuid"],
             })
-        
+
         # Sort by timestamp to maintain order
         llm_responses.sort(key=lambda r: r["timestamp"])
 
@@ -392,7 +392,7 @@ def _(
 
             llm_responses = session.get("llm_responses", [])
             user_prompts = session.get("user_prompts", [])
-            
+
             if not llm_responses:
                 result["status"] = "skipped"
                 result["error"] = "No LLM responses found"
@@ -448,7 +448,7 @@ def _(
                 is_last_assistant = (i == len(all_entries) - 1 and entry["type"] == "llm_response")
                 if is_last_assistant:
                     continue
-                    
+
                 if entry["type"] == "user":
                     messages.append({
                         "role": "user",
@@ -460,7 +460,7 @@ def _(
                         "role": "assistant",
                         "content": response.get("text") or None,
                     }
-                    
+
                     # Include tool_calls in OpenAI format if present
                     tool_calls_for_msg = []
                     for tc in response.get("tool_calls", []):
@@ -472,12 +472,12 @@ def _(
                                 "arguments": json.dumps(tc.get("input", {}))
                             }
                         })
-                    
+
                     if tool_calls_for_msg:
                         asst_entry["tool_calls"] = tool_calls_for_msg
-                    
+
                     messages.append(asst_entry)
-                    
+
                     # Add tool results as separate messages
                     for tc in response.get("tool_calls", []):
                         if tc.get("result"):
@@ -490,7 +490,7 @@ def _(
             # 1. CREATE SESSION CALL (root trace)
             session_id = session["session_id"]
             session_display = f"[{session_id[:8]}] {display_name}" if display_name else session_id
-            
+
             session_call = client.create_call(
                 op="claude_code.session",
                 inputs={
@@ -537,6 +537,7 @@ def _(
                         }
                     }],
                     # Keep existing rollup stats
+                    "user_message_count": len(user_prompts),
                     "llm_responses_count": len(llm_responses),
                     "tool_calls_count": total_tool_calls,
                     "total_tokens": total_tokens,
@@ -561,18 +562,21 @@ def _(
                     "data": response,
                     "timestamp": response["timestamp"],
                 })
-            
+
             # Sort by timestamp to maintain conversation order
             all_messages.sort(key=lambda m: m["timestamp"])
 
             # Create traces for each message
+            # Track current user call to nest LLM responses under it
+            current_user_call = None
+
             for i, msg in enumerate(all_messages):
                 if msg["type"] == "user":
                     # Create user message trace
                     prompt = msg["data"]
                     prompt_text = prompt.get("text", "")
                     prompt_display = f"User: {prompt_text[:60]}..." if len(prompt_text) > 60 else f"User: {prompt_text}"
-                    
+
                     user_call = client.create_call(
                         op="claude_code.user_message",
                         inputs={"content": prompt_text[:5000]},
@@ -584,12 +588,15 @@ def _(
                     if prompt.get("timestamp"):
                         user_call.started_at = prompt.get("timestamp")
                         user_call.ended_at = prompt.get("timestamp")
-                    
+
                     client.finish_call(
                         user_call,
                         output={"message_uuid": prompt.get("uuid")},
                     )
                     weave_calls += 1
+
+                    # Track this user call for nesting subsequent LLM responses
+                    current_user_call = user_call
 
                 elif msg["type"] == "llm_response":
                     # Create LLM response trace
@@ -597,7 +604,7 @@ def _(
                     response_text = response.get("text", "")
                     message_id = response.get("message_id", f"response_{i}")
                     model = response.get("model", "unknown")
-                    
+
                     # Create display name from text or tool names
                     if response_text:
                         response_display = f"{model}: {response_text[:40]}..."
@@ -606,6 +613,9 @@ def _(
                         response_display = f"{model}: {', '.join(tool_names[:3])}"
                     else:
                         response_display = f"{model} response {i+1}"
+
+                    # Nest under current user message, or session if no user message yet
+                    parent = current_user_call if current_user_call else session_call
 
                     response_call = client.create_call(
                         op="claude_code.llm_response",
@@ -616,7 +626,7 @@ def _(
                         attributes={
                             "weave": {"kind": "llm"},
                         },
-                        parent=session_call,  # NESTED UNDER SESSION
+                        parent=parent,  # NESTED UNDER USER MESSAGE
                         display_name=response_display,
                         use_stack=False,
                     )
