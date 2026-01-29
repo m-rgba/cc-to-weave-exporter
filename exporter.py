@@ -503,6 +503,7 @@ def _(
                     "project": project_name,
                 },
                 attributes={
+                    "weave": {"kind": "agent"},
                     "session_id": session_id,
                     "session_uuid": session_id,  # Full UUID for debugging
                     "claude_code_version": session.get("version"),
@@ -612,6 +613,9 @@ def _(
                             "model": model,
                             "message_id": message_id,
                         },
+                        attributes={
+                            "weave": {"kind": "llm"},
+                        },
                         parent=session_call,  # NESTED UNDER SESSION
                         display_name=response_display,
                         use_stack=False,
@@ -650,6 +654,9 @@ def _(
                         tool_call = client.create_call(
                             op=f"claude_code.tool.{tool_name}",
                             inputs=truncated_input,
+                            attributes={
+                                "weave": {"kind": "tool"},
+                            },
                             parent=response_call,  # NESTED UNDER LLM RESPONSE
                             display_name=tool_name,
                             use_stack=False,
