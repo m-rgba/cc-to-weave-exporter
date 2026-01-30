@@ -1,3 +1,5 @@
+<img width="898" height="882" alt="image" src="https://github.com/user-attachments/assets/6324e0bf-91b8-4f1f-a1ba-48cfe7bb7e3f" />
+
 ## Claude Code exporter to Weave
 
 - Exports Claude Code sessions to Weave.
