@@ -10,6 +10,7 @@
 #     "traitlets>=5.14.3",
 #     "weave==0.52.25",
 #     "mcp==1.26.0",
+#     "python-dateutil==2.9.0.post0",
 # ]
 # ///
 
@@ -26,11 +27,19 @@ def _():
     import marimo as mo
     import re
     import pandas as pd
+    import traceback
     import weave
 
     from pathlib import Path
     from datetime import datetime
+    from dateutil import parser as dateutil_parser
+    from uuid import UUID
     from weave.trace.context.weave_client_context import require_weave_client
+
+    # Constants for display text truncation
+    MAX_DISPLAY_NAME_LENGTH = 50
+    MAX_PROMPT_DISPLAY_LENGTH = 60
+    MAX_RESPONSE_DISPLAY_LENGTH = 40
 
     # State to track export completion - when updated, triggers button recreation
     get_export_count, set_export_count = mo.state(0)
@@ -58,10 +67,15 @@ def _():
     connect_button = mo.ui.run_button(label="Connect")
     mo.vstack([title, project_name_label, WANDB_PROJECT_NAME, api_key_label, WANDB_API_KEY, connect_button])
     return (
+        MAX_DISPLAY_NAME_LENGTH,
+        MAX_PROMPT_DISPLAY_LENGTH,
+        MAX_RESPONSE_DISPLAY_LENGTH,
         Path,
+        UUID,
         WANDB_API_KEY,
         WANDB_PROJECT_NAME,
         connect_button,
+        dateutil_parser,
         datetime,
         get_connected,
         get_export_count,
@@ -123,6 +137,20 @@ def _(Path, get_connected, mo, os, pd):
     projects_df = pd.DataFrame()
     if get_connected():
         # Find claude projects
+        def get_claude_projects_search_locations():
+            """Get list of potential Claude projects directory locations.
+
+            Returns:
+                List of Path objects to search for Claude projects.
+            """
+            home = Path.home()
+            return [
+                home / ".claude" / "projects",                        # Standard Default
+                home / ".config" / "claude" / "projects",             # XDG Style (Linux)
+                home / "AppData" / "Roaming" / "Claude" / "projects", # Windows Style
+                Path("/usr/local/share/claude/projects")              # Global Install
+            ]
+
         def find_claude_projects():
             # 1. Check for Environment Variable Override
             env_path = os.getenv("CLAUDE_CONFIG_DIR")
@@ -131,14 +159,8 @@ def _(Path, get_connected, mo, os, pd):
                 if potential_path.exists():
                     return potential_path
 
-            # 2. Define common search locations
-            home = Path.home()
-            search_locations = [
-                home / ".claude" / "projects",                        # Standard Default
-                home / ".config" / "claude" / "projects",             # XDG Style (Linux)
-                home / "AppData" / "Roaming" / "Claude" / "projects", # Windows Style
-                Path("/usr/local/share/claude/projects")              # Global Install
-            ]
+            # 2. Search common locations
+            search_locations = get_claude_projects_search_locations()
 
             # 3. Iterate and verify existence
             for loc in search_locations:
@@ -165,10 +187,10 @@ def _(Path, get_connected, mo, os, pd):
             })
         else:
             print("❌ Could not find the Claude projects folder automatically.")
-    
+
     # Create UI element outside the conditional - doesn't depend on table selection
     projects_table = mo.ui.table(data=projects_df, selection="multi")
-    return projects_df, projects_table
+    return get_claude_projects_search_locations, projects_df, projects_table
 
 
 @app.cell
@@ -216,9 +238,15 @@ def _(export_traces, set_should_export):
 
 @app.cell
 def _(
+    MAX_DISPLAY_NAME_LENGTH,
+    MAX_PROMPT_DISPLAY_LENGTH,
+    MAX_RESPONSE_DISPLAY_LENGTH,
     Path,
+    UUID,
     WANDB_PROJECT_NAME,
+    dateutil_parser,
     datetime,
+    get_claude_projects_search_locations,
     get_connected,
     get_export_count,
     get_should_export,
@@ -237,21 +265,38 @@ def _(
         selected_projects = projects_table.value
         export_messages = []
 
-        # UUID pattern to match session files (not agent-* files)
-        UUID_PATTERN = re.compile(
-            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$",
-            re.IGNORECASE,
-        )
-
         def is_uuid_filename(filename):
-            """Check if filename matches UUID pattern (not agent-xxxx files)."""
-            return UUID_PATTERN.match(filename) is not None
+            """Check if filename is a valid UUID JSONL file (not agent-* files).
+
+            Args:
+                filename: The filename to check.
+
+            Returns:
+                True if filename is in format <uuid>.jsonl, False otherwise.
+            """
+            if not filename.endswith('.jsonl'):
+                return False
+            try:
+                # Remove .jsonl extension and try to parse as UUID
+                UUID(filename[:-6])
+                return True
+            except (ValueError, AttributeError):
+                return False
 
         def parse_timestamp(ts):
-            """Parse ISO timestamp from Claude session."""
-            if ts.endswith("Z"):
-                ts = ts[:-1] + "+00:00"
-            return datetime.fromisoformat(ts)
+            """Parse ISO timestamp from Claude session using dateutil for robustness.
+
+            Args:
+                ts: Timestamp string in ISO format.
+
+            Returns:
+                datetime object.
+            """
+            try:
+                return dateutil_parser.isoparse(ts)
+            except (ValueError, TypeError):
+                # Fallback to current time if parsing fails
+                return datetime.now()
 
         def find_session_files(project_path):
             """Find all UUID-named session JSONL files in a project directory."""
@@ -493,7 +538,7 @@ def _(
 
                 # Get first user prompt for display
                 first_prompt = user_prompts[0]["text"] if user_prompts else ""
-                display_name = (first_prompt[:50] + "...") if len(first_prompt) > 50 else first_prompt
+                display_name = (first_prompt[:MAX_DISPLAY_NAME_LENGTH] + "...") if len(first_prompt) > MAX_DISPLAY_NAME_LENGTH else first_prompt
 
                 # Get session timestamps
                 session_started = user_prompts[0]["timestamp"] if user_prompts else (llm_responses[0]["timestamp"] if llm_responses else None)
@@ -653,7 +698,7 @@ def _(
                         # Create user message trace
                         prompt = msg["data"]
                         prompt_text = prompt.get("text", "")
-                        prompt_display = f"User: {prompt_text[:60]}..." if len(prompt_text) > 60 else f"User: {prompt_text}"
+                        prompt_display = f"User: {prompt_text[:MAX_PROMPT_DISPLAY_LENGTH]}..." if len(prompt_text) > MAX_PROMPT_DISPLAY_LENGTH else f"User: {prompt_text}"
 
                         user_call = client.create_call(
                             op="claude_code.user_message",
@@ -685,7 +730,7 @@ def _(
 
                         # Create display name from text or tool names
                         if response_text:
-                            response_display = f"{model}: {response_text[:40]}..."
+                            response_display = f"{model}: {response_text[:MAX_RESPONSE_DISPLAY_LENGTH]}..."
                         elif response.get("tool_calls"):
                             tool_names = [tc.get("name", "unknown") for tc in response.get("tool_calls", [])]
                             response_display = f"{model}: {', '.join(tool_names[:3])}"
@@ -763,8 +808,6 @@ def _(
                 })
 
             except Exception as e:
-                result["error"] = str(e)
-                import traceback
                 result["error"] = f"{str(e)}\n{traceback.format_exc()}"
 
             return result
@@ -784,20 +827,17 @@ def _(
                 try:
                     export_messages.append(f"✅ Using Weave project: {WANDB_PROJECT_NAME.value}")
 
-                    # Find Claude projects directory
-                    home = Path.home()
-                    search_locations = [
-                        home / ".claude" / "projects",
-                        home / ".config" / "claude" / "projects",
-                        home / "AppData" / "Roaming" / "Claude" / "projects",
-                        Path("/usr/local/share/claude/projects")
-                    ]
-
-                    projects_base = None
-                    for loc in search_locations:
-                        if loc.exists():
-                            projects_base = loc
-                            break
+                    # Find Claude projects directory using shared function
+                    env_path = os.getenv("CLAUDE_CONFIG_DIR")
+                    if env_path:
+                        potential_path = Path(env_path) / "projects"
+                        projects_base = potential_path if potential_path.exists() else None
+                    else:
+                        projects_base = None
+                        for loc in get_claude_projects_search_locations():
+                            if loc.exists():
+                                projects_base = loc
+                                break
 
                     if projects_base:
                         # Process each selected project
